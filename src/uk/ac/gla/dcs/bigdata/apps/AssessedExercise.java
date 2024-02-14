@@ -3,6 +3,7 @@ package uk.ac.gla.dcs.bigdata.apps;
 import java.io.File;
 import java.util.List;
 import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
@@ -10,9 +11,11 @@ import org.apache.spark.sql.SparkSession;
 
 import uk.ac.gla.dcs.bigdata.providedfunctions.NewsFormaterMap;
 import uk.ac.gla.dcs.bigdata.providedfunctions.QueryFormaterMap;
+import uk.ac.gla.dcs.bigdata.providedstructures.ContentItem;
 import uk.ac.gla.dcs.bigdata.providedstructures.DocumentRanking;
 import uk.ac.gla.dcs.bigdata.providedstructures.NewsArticle;
 import uk.ac.gla.dcs.bigdata.providedstructures.Query;
+import uk.ac.gla.dcs.bigdata.providedutilities.TextPreProcessor;
 
 /**
  * This is the main class where your Spark topology should be specified.
@@ -94,6 +97,22 @@ public class AssessedExercise {
 		// Perform an initial conversion from Dataset<Row> to Query and NewsArticle Java objects
 		Dataset<Query> queries = queriesjson.map(new QueryFormaterMap(), Encoders.bean(Query.class)); // this converts each row into a Query
 		Dataset<NewsArticle> news = newsjson.map(new NewsFormaterMap(), Encoders.bean(NewsArticle.class)); // this converts each row into a NewsArticle
+		
+		NewsArticle firstArticle = news.first(); // Assuming news is not empty
+		String id = firstArticle.getId();
+		List<ContentItem> contents = firstArticle.getContents();
+		System.out.println("CONTENTS:-" + id);
+
+		//Creating obkject for textpreprocess class
+		TextPreProcessor textPreProcessor = new TextPreProcessor();
+		
+
+		
+
+		//Need to convert Dataset form type newsarticle to type string so we can use the text preprocessor
+		// check Newsarticle.java and ContentItem.java
+
+
 		
 		//----------------------------------------------------------------
 		// Your Spark Topology should be defined here
