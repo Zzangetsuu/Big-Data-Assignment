@@ -1,21 +1,40 @@
 package uk.ac.gla.dcs.bigdata.apps;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
+
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
+import org.apache.spark.sql.KeyValueGroupedDataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.util.LongAccumulator;
 
+import scala.Tuple2;
 import uk.ac.gla.dcs.bigdata.providedfunctions.NewsFormaterMap;
 import uk.ac.gla.dcs.bigdata.providedfunctions.QueryFormaterMap;
-import uk.ac.gla.dcs.bigdata.providedstructures.ContentItem;
 import uk.ac.gla.dcs.bigdata.providedstructures.DocumentRanking;
 import uk.ac.gla.dcs.bigdata.providedstructures.NewsArticle;
 import uk.ac.gla.dcs.bigdata.providedstructures.Query;
-import uk.ac.gla.dcs.bigdata.providedutilities.TextPreProcessor;
+import uk.ac.gla.dcs.bigdata.providedstructures.RankedResult;
+import uk.ac.gla.dcs.bigdata.studentfunctions.ArticleQueryScoreFormaterMap;
+import uk.ac.gla.dcs.bigdata.studentfunctions.ArticleQueryScoreToQuery;
+import uk.ac.gla.dcs.bigdata.studentfunctions.DocumentRankingMap;
+import uk.ac.gla.dcs.bigdata.studentfunctions.FullDocumentRankingMapGroup;
+import uk.ac.gla.dcs.bigdata.studentfunctions.NewsFormaterFlatMap;
+import uk.ac.gla.dcs.bigdata.studentfunctions.PostNewsFormaterFlatMap;
+import uk.ac.gla.dcs.bigdata.studentfunctions.QueryFormaterFlatMap;
+import uk.ac.gla.dcs.bigdata.studentfunctions.TermFrequencyFlatMap;
+import uk.ac.gla.dcs.bigdata.studentfunctions.TotalFrequencyReduceGroups;
+import uk.ac.gla.dcs.bigdata.studentfunctions.TupleToInteger;
+import uk.ac.gla.dcs.bigdata.studentfunctions.TupleToString;
+import uk.ac.gla.dcs.bigdata.studentstructures.ArticleQueryScore;
+import uk.ac.gla.dcs.bigdata.studentstructures.PostNewsArticle;
 
 /**
  * This is the main class where your Spark topology should be specified.
@@ -83,7 +102,6 @@ public class AssessedExercise {
 			}
 		}
 		
-		
 	}
 	
 	
@@ -98,28 +116,132 @@ public class AssessedExercise {
 		Dataset<Query> queries = queriesjson.map(new QueryFormaterMap(), Encoders.bean(Query.class)); // this converts each row into a Query
 		Dataset<NewsArticle> news = newsjson.map(new NewsFormaterMap(), Encoders.bean(NewsArticle.class)); // this converts each row into a NewsArticle
 		
-		NewsArticle firstArticle = news.first(); // Assuming news is not empty
-		String id = firstArticle.getId();
-		List<ContentItem> contents = firstArticle.getContents();
-		System.out.println("CONTENTS:-" + id);
-
-		//Creating obkject for textpreprocess class
-		TextPreProcessor textPreProcessor = new TextPreProcessor();
-		
-
-		
-
-		//Need to convert Dataset form type newsarticle to type string so we can use the text preprocessor
-		// check Newsarticle.java and ContentItem.java
-
-
-		
 		//----------------------------------------------------------------
 		// Your Spark Topology should be defined here
 		//----------------------------------------------------------------
 		
+		// Step 1: Preprocess news articles to get the values.
 		
-		return null; // replace this with the the list of DocumentRanking output by your topology
+		// Create accumulators to calculate total number of documents and the total length of the documents in the corpus.
+		LongAccumulator totalDocsInCorpusAccumulator = spark.sparkContext().longAccumulator();
+		LongAccumulator totalDocumentLengthInCorpusAccumulator = spark.sparkContext().longAccumulator();
+				
+		// We are going to focus on 3 properties news id, title, and content. Also by doing news pre-processing 
+		// that will map news object to post processed news object that contain tokens of an article
+		// and count of the number of terms within docmentTerms and The number of times each term appears in the document.
+
+		Encoder<PostNewsArticle> postNewsArticleEncoder = Encoders.bean(PostNewsArticle.class);
+		Dataset<PostNewsArticle> postNewsArticles =  news.flatMap(
+			new PostNewsFormaterFlatMap(totalDocsInCorpusAccumulator, totalDocumentLengthInCorpusAccumulator),
+			postNewsArticleEncoder);
+		
+		// Step 2: Get the term frequencies for all the query terms that exist within the corpus.
+		
+		// Get all the query terms.
+		Dataset<String> queryTerms = queries.flatMap(new QueryFormaterFlatMap(), Encoders.STRING());
+		List<String> queryTermsList = queryTerms.collectAsList();
+		
+		// Create a broadcast from the query terms list.
+		Broadcast<List<String>> broadcastQueryTermsList = JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(queryTermsList);
+		
+		// Get all the the term frequencies for the query terms using a flatmap.
+		Encoder<Tuple2<String, Integer>> termFrequencyEncoder = Encoders.tuple(Encoders.STRING(), Encoders.INT());
+		Dataset<Tuple2<String, Integer>> termFrequencies = postNewsArticles.flatMap(new TermFrequencyFlatMap(broadcastQueryTermsList), termFrequencyEncoder);
+		
+		// Group the term frequencies by the query term and map each query term to its frequency.
+		TupleToString keyFunction = new TupleToString();
+		TupleToInteger valueFunction = new TupleToInteger();
+		KeyValueGroupedDataset<String, Integer> groupedTermFrequencies = termFrequencies.groupByKey(keyFunction, Encoders.STRING()).mapValues(valueFunction, Encoders.INT());
+		
+		// For each query term, reduce the groups to calculate the total term frequencies.
+		Dataset<Tuple2<String, Integer>> termFrequencyIntegers = groupedTermFrequencies.reduceGroups(new TotalFrequencyReduceGroups());
+		List<Tuple2<String, Integer>> totalTermFrequencyInCorpus = termFrequencyIntegers.collectAsList();
+		
+		// Get the values of and print the total number of documents in the corpus.
+		long totalDocsInCorpus = totalDocsInCorpusAccumulator.value();
+		System.out.println("totalDocsInCorpus: " + totalDocsInCorpus);
+
+		// Get the values of and print the total length of all the documents in the corpus.
+		long totalDocumentLengthInCorpus = totalDocumentLengthInCorpusAccumulator.value();
+		System.out.println("totalDocumentLengthInCorpus: " + totalDocumentLengthInCorpus);
+		
+		// Calculate and print the average document length of the corpus.
+		double averageDocumentLengthInCorpus = totalDocumentLengthInCorpus*1.0 / totalDocsInCorpus;
+		System.out.println("averageDocumentLengthInCorpus: " + averageDocumentLengthInCorpus);
+		
+		// Step 3: Calculate the article query scores.
+		
+		// Collect the queries to send them as a broadcast.
+		List<Query> queryList = queries.collectAsList();
+		Broadcast<List<Query>> broadcastQueryList = JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(queryList);
+		
+		// Create a broadcast of the total query term frequencies collected from Step 2.
+		Broadcast<List<Tuple2<String, Integer>>> broadcastTotalTermFrequencyInCorpus = JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(totalTermFrequencyInCorpus);
+		
+		// Calculate the scores for each query and document pair and return them as a dataset of ArticleQueryScore objects.
+		Encoder<ArticleQueryScore> articleQueryScoreEncoder = Encoders.bean(ArticleQueryScore.class);
+		Dataset<ArticleQueryScore> articleQueryScores = postNewsArticles.flatMap(new ArticleQueryScoreFormaterMap(
+				broadcastQueryList,
+				broadcastTotalTermFrequencyInCorpus,
+				totalDocsInCorpus,
+				averageDocumentLengthInCorpus
+				), articleQueryScoreEncoder);
+				
+		// Step 4: Group and rank documents.
+		
+		// Group the ArticleQueryScore dataset by queries.
+		ArticleQueryScoreToQuery keyFunction2 = new ArticleQueryScoreToQuery();
+		KeyValueGroupedDataset<Query, ArticleQueryScore> groupedArticleQueryScores = articleQueryScores.groupByKey(keyFunction2, Encoders.bean(Query.class));
+				
+		// Rank the ArticleQueryScore groups and convert into the DocumentRanking object.
+		Encoder<DocumentRanking> documentRankingEncoder = Encoders.bean(DocumentRanking.class);
+		Dataset<DocumentRanking> fullDocumentRanking = groupedArticleQueryScores.mapGroups(new FullDocumentRankingMapGroup(), documentRankingEncoder);
+		
+		// Step 5: Remove redundancy.
+		
+		// Remove the redundancy from the DocumentRanking dataset using similarity scores.
+		Dataset<DocumentRanking> documentRanking = fullDocumentRanking.map(new DocumentRankingMap(), documentRankingEncoder);
+		List<DocumentRanking> documentRankingList = documentRanking.collectAsList();
+		
+		// Step 6: Retrieve the NewsArticle for each document and re-add it into the final DocumentRanking list.
+		
+		// Get all the document ids in the final document rankings.
+		List<String> docids = new ArrayList<String>();
+		for(DocumentRanking docRank: documentRankingList) {
+			for (RankedResult rankedResult: docRank.getResults()) {
+				docids.add(rankedResult.getDocid());
+			}
+		}
+		
+		// Create a broadcast for the document ids.
+		Broadcast<List<String>> broadcastDocids = JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(docids);
+		
+		// Map through the the news articles and get only the articles that are in the final document ids.
+		Dataset<NewsArticle> rankedNewsArticles = news.flatMap(new NewsFormaterFlatMap(broadcastDocids), Encoders.bean(NewsArticle.class));
+		List<NewsArticle> rankedNewsArticlesList = rankedNewsArticles.collectAsList();
+		
+		// Set the collected articles back into the final DocumentRanking list.
+		for(DocumentRanking docRank: documentRankingList) {
+			for (RankedResult rankedResult: docRank.getResults()) {
+				for (NewsArticle newsArticle: rankedNewsArticlesList) {
+					if (rankedResult.getDocid().equals(newsArticle.getId())) {
+						rankedResult.setArticle(newsArticle);
+					}
+				}
+			}
+		}
+		
+		// Print the results.
+		for(DocumentRanking docRank: documentRankingList) {
+			System.out.println(docRank.getQuery().getOriginalQuery());
+			for (RankedResult result: docRank.getResults()) {
+				System.out.printf("%.2f: %s\n", result.getScore(), result.getArticle().getTitle());
+			}
+			System.out.println("\n***\n");
+		}
+		
+		return documentRankingList; // replace this with the the list of DocumentRanking output by your topology
+
 	}
 	
 	
